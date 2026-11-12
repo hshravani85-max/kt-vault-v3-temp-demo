@@ -14,11 +14,14 @@ if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
 
 # Populate os.environ from Streamlit Cloud / host secrets before any app imports
+# Always refresh KT_* and AZAPI_* keys so in-place Streamlit Secrets updates take effect cleanly
 try:
     import streamlit as st
     for _k, _v in st.secrets.items():
-        if isinstance(_v, (str, int, float, bool)) and _k not in os.environ:
-            os.environ[str(_k)] = str(_v)
+        if isinstance(_v, (str, int, float, bool)):
+            _ks = str(_k)
+            if _ks.startswith(("KT_", "AZAPI_")) or _ks not in os.environ:
+                os.environ[_ks] = str(_v)
 except Exception:
     pass
 

@@ -271,10 +271,16 @@ def _sync_demo_accounts_transition(database, auth_services) -> list[str]:
     conn = database.get_connection()
     events = []
     try:
-        non_demo = conn.execute(
-            "SELECT COUNT(*) FROM customers WHERE id NOT LIKE 'DEMO-%'"
-        ).fetchone()[0]
-        if non_demo > 0:
+        db_name = os.path.basename(database.get_db_path()).lower()
+        if db_name != "kt_vault_demo.db":
+            return ["SKIPPED_NON_DEMO_DB"]
+        has_demo_seed = conn.execute(
+            "SELECT COUNT(*) FROM customers WHERE id LIKE 'DEMO-%'"
+        ).fetchone()[0] > 0
+        has_real_records = conn.execute(
+            "SELECT COUNT(*) FROM customers WHERE id IN ('KT-C-0005', 'KT-C-0006')"
+        ).fetchone()[0] > 0
+        if not has_demo_seed or has_real_records:
             return ["SKIPPED_NON_DEMO_DB"]
 
         audit_actions = []
@@ -472,9 +478,13 @@ def ensure_demo_vault() -> dict:
         return {"bootstrapped": False, "reason": "KT_DEMO_BOOTSTRAP not enabled"}
 
     app_dir = os.path.dirname(os.path.abspath(__file__))
-    db_path = os.environ.get("KT_VAULT_DB_PATH") or os.path.join(app_dir, "demo_runtime", "data", "kt_vault_demo.db")
-    storage_root = os.environ.get("KT_VAULT_STORAGE_ROOT") or os.path.join(app_dir, "demo_runtime", "documents")
-    log_dir = os.environ.get("KT_VAULT_LOG_DIR") or os.path.join(app_dir, "demo_runtime", "logs")
+    raw_db = os.environ.get("KT_VAULT_DB_PATH") or os.path.join("demo_runtime", "data", "kt_vault_demo.db")
+    raw_storage = os.environ.get("KT_VAULT_STORAGE_ROOT") or os.path.join("demo_runtime", "documents")
+    raw_logs = os.environ.get("KT_VAULT_LOG_DIR") or os.path.join("demo_runtime", "logs")
+
+    db_path = raw_db if os.path.isabs(raw_db) else os.path.join(app_dir, raw_db)
+    storage_root = raw_storage if os.path.isabs(raw_storage) else os.path.join(app_dir, raw_storage)
+    log_dir = raw_logs if os.path.isabs(raw_logs) else os.path.join(app_dir, raw_logs)
 
     os.environ["KT_VAULT_DB_PATH"] = os.path.realpath(db_path)
     os.environ["KT_VAULT_STORAGE_ROOT"] = os.path.realpath(storage_root)
