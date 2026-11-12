@@ -127,7 +127,7 @@ def initiate_recovery(doc_dict, target_doc_id):
     data_hash = hashlib.sha256(raw_stored.encode('utf-8')).hexdigest()
     
     req_n = doc_dict['req_name'] if ('req_name' in doc_dict.keys() and doc_dict['req_name']) else ''
-    res = document_processor.process_document(doc_dict['file_path'], file_bytes, expected_requirement=req_n)
+    res = document_processor.process_document(doc_dict['file_path'], file_bytes, expected_requirement=req_n, session_token=st_token, require_auth=True)
     extracted = res.get('extracted_fields', {})
     if res.get('document_type') == 'Arrival / Entry Document' and not extracted.get('Trip Name'):
         trip_title = doc_dict['trip_name'] if ('trip_name' in doc_dict.keys() and doc_dict['trip_name']) else ''

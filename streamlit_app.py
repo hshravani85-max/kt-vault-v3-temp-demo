@@ -25,6 +25,19 @@ try:
 except Exception:
     pass
 
+# Refresh cached AZAPI adapter automatically if Streamlit Secrets changed AZAPI settings
+try:
+    import azapi_adapter as _az_mod
+    if getattr(_az_mod, "_default_adapter", None) is not None:
+        _cur_cfg = _az_mod._default_adapter.config
+        _env_en = os.environ.get("AZAPI_ENABLED", "").lower().strip() in ("1", "true", "yes", "on")
+        _env_key = (os.environ.get("AZAPI_API_KEY") or os.environ.get("AZAPI_AUTH_TOKEN") or "").strip()
+        _env_base = (os.environ.get("AZAPI_BASE_URL") or _az_mod.DEFAULT_BASE_URL).strip().rstrip("/")
+        if _cur_cfg.enabled != _env_en or _cur_cfg.api_key != _env_key or _cur_cfg.base_url != _env_base:
+            _az_mod.reset_azapi_adapter()
+except Exception:
+    pass
+
 import demo_bootstrap
 demo_bootstrap.ensure_demo_vault()
 

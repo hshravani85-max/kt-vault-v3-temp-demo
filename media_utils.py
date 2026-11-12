@@ -143,6 +143,16 @@ def rasterize_pdf_page_to_jpeg(
         except Exception as e:
             logger.warning("Poppler rasterization failed: %s", type(e).__name__)
         finally:
+            for root_d, _, fnames in os.walk(temp_dir):
+                for fn in fnames:
+                    fp = os.path.join(root_d, fn)
+                    try:
+                        sz = os.path.getsize(fp)
+                        with open(fp, "r+b") as wf:
+                            wf.write(b"\x00" * sz)
+                            wf.flush()
+                    except Exception:
+                        pass
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     # Embedded image fallback using pypdf + Pillow

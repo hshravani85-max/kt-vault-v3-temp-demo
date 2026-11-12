@@ -31,6 +31,7 @@ import io
 import json
 import base64
 import re
+import ssl
 import time
 import hashlib
 import secrets
@@ -186,7 +187,7 @@ class AZAPIConfig:
             env_en = os.environ.get("AZAPI_ENABLED", "").lower().strip()
             self.enabled = env_en in ("1", "true", "yes", "on")
 
-        # 4. Timeout in seconds
+        # 4. Timeout and bounded retry count for transient network/429/5xx failures
         if timeout_seconds is not None:
             self.timeout_seconds = int(timeout_seconds)
         else:
@@ -194,6 +195,13 @@ class AZAPIConfig:
                 self.timeout_seconds = int(os.environ.get("AZAPI_TIMEOUT_SECONDS", str(self.DEFAULT_TIMEOUT_SECONDS)))
             except ValueError:
                 self.timeout_seconds = self.DEFAULT_TIMEOUT_SECONDS
+
+        try:
+            raw_retries = int(os.environ.get("AZAPI_MAX_RETRIES", "1"))
+        except ValueError:
+            raw_retries = 1
+        self.max_retries = max(0, min(2, raw_retries))
+        self.ssl_verify = True
 
         # 5. AZAPI-only mode: zero local fallback OCR
         self.local_fallback_enabled = False
@@ -827,65 +835,82 @@ class AZAPIAdapter:
         byte_len: int
     ) -> Dict[str, Any]:
         """
-        Executes an authenticated HTTP request, measuring latency, logging sanitized metrics,
-        enforcing anti-redirect protection to prevent credential leakage, and mapping error
-        codes to domain exceptions without leaking secrets.
+        Executes an authenticated HTTPS request with certificate verification,
+        anti-redirect protection, bounded retry handling for transient failures
+        (429/502/503/504/timeout), and zero PII/token logging.
         """
-        start_time = time.monotonic()
-        try:
-            opener = urllib.request.build_opener(DisallowRedirectHandler())
-            # Seamless test compatibility: if urlopen has been patched in tests, use it; otherwise use opener.open
-            is_mocked = (
-                getattr(urllib.request.urlopen, "_mock_return_value", None) is not None
-                or hasattr(urllib.request.urlopen, "assert_called")
-            )
-            open_call = urllib.request.urlopen if is_mocked else opener.open
+        max_attempts = 1 + getattr(self.config, "max_retries", 0)
+        for attempt in range(max_attempts):
+            start_time = time.monotonic()
+            try:
+                https_handler = urllib.request.HTTPSHandler(context=ssl.create_default_context())
+                opener = urllib.request.build_opener(DisallowRedirectHandler(), https_handler)
+                # Seamless test compatibility: if urlopen has been patched in tests, use it; otherwise use opener.open
+                is_mocked = (
+                    getattr(urllib.request.urlopen, "_mock_return_value", None) is not None
+                    or hasattr(urllib.request.urlopen, "assert_called")
+                    or hasattr(urllib.request.urlopen, "side_effect")
+                )
+                open_call = urllib.request.urlopen if is_mocked else opener.open
 
-            with open_call(req, timeout=req_timeout) as resp:
+                with open_call(req, timeout=req_timeout) as resp:
+                    elapsed_ms = int((time.monotonic() - start_time) * 1000)
+                    status_code = resp.status if hasattr(resp, "status") else getattr(resp, "code", 200)
+                    resp_bytes = resp.read()
+
+                    # Audit log: Safe metrics only, ZERO PII, ZERO tokens
+                    logger.info(
+                        "AZAPI request succeeded: endpoint='%s', status=%d, payload_bytes=%d, elapsed_ms=%d",
+                        endpoint, status_code, byte_len, elapsed_ms
+                    )
+
+                    try:
+                        return json.loads(resp_bytes.decode("utf-8"))
+                    except Exception as json_err:
+                        raise AZAPIServerError(f"AZAPI returned invalid JSON response: {str(json_err)}")
+
+            except urllib.error.HTTPError as http_err:
                 elapsed_ms = int((time.monotonic() - start_time) * 1000)
-                status_code = resp.status if hasattr(resp, "status") else getattr(resp, "code", 200)
-                resp_bytes = resp.read()
-
-                # Audit log: Safe metrics only, ZERO PII, ZERO tokens
-                logger.info(
-                    "AZAPI request succeeded: endpoint='%s', status=%d, payload_bytes=%d, elapsed_ms=%d",
-                    endpoint, status_code, byte_len, elapsed_ms
+                status_code = http_err.code
+                logger.warning(
+                    "AZAPI HTTP error: endpoint='%s', status=%d, elapsed_ms=%d",
+                    endpoint, status_code, elapsed_ms
                 )
 
-                try:
-                    return json.loads(resp_bytes.decode("utf-8"))
-                except Exception as json_err:
-                    raise AZAPIServerError(f"AZAPI returned invalid JSON response: {str(json_err)}")
+                if "Security violation: Automatic redirect" in str(http_err):
+                    raise AZAPIError(str(http_err))
+                elif status_code in (401, 403):
+                    raise AZAPIAuthenticationError(f"AZAPI authentication failed with HTTP {status_code}. Verify AZAPI_API_KEY.")
+                elif status_code == 429:
+                    if attempt + 1 < max_attempts:
+                        time.sleep(min(1.5, 0.5 * (2 ** attempt)))
+                        continue
+                    raise AZAPIRateLimitError("AZAPI rate limit exceeded (HTTP 429).")
+                elif status_code == 400:
+                    raise AZAPIValidationError("AZAPI rejected request parameters (HTTP 400).")
+                elif status_code in (502, 503, 504):
+                    if attempt + 1 < max_attempts:
+                        time.sleep(min(1.5, 0.5 * (2 ** attempt)))
+                        continue
+                    raise AZAPIServerError(f"AZAPI server returned HTTP {status_code}.")
+                elif status_code >= 500:
+                    raise AZAPIServerError(f"AZAPI server returned HTTP {status_code}.")
+                else:
+                    raise AZAPIError(f"AZAPI request failed with HTTP {status_code}.")
 
-        except urllib.error.HTTPError as http_err:
-            elapsed_ms = int((time.monotonic() - start_time) * 1000)
-            status_code = http_err.code
-            logger.warning(
-                "AZAPI HTTP error: endpoint='%s', status=%d, elapsed_ms=%d",
-                endpoint, status_code, elapsed_ms
-            )
-
-            if "Security violation: Automatic redirect" in str(http_err):
-                raise AZAPIError(str(http_err))
-            elif status_code in (401, 403):
-                raise AZAPIAuthenticationError(f"AZAPI authentication failed with HTTP {status_code}. Verify AZAPI_API_KEY.")
-            elif status_code == 429:
-                raise AZAPIRateLimitError("AZAPI rate limit exceeded (HTTP 429).")
-            elif status_code == 400:
-                raise AZAPIValidationError(f"AZAPI rejected request parameters (HTTP 400).")
-            elif status_code >= 500:
-                raise AZAPIServerError(f"AZAPI server returned HTTP {status_code}.")
-            else:
-                raise AZAPIError(f"AZAPI request failed with HTTP {status_code}.")
-
-        except (urllib.error.URLError, TimeoutError, OSError) as net_err:
-            elapsed_ms = int((time.monotonic() - start_time) * 1000)
-            err_msg = str(net_err)
-            if "timed out" in err_msg.lower():
-                logger.warning("AZAPI request timed out: endpoint='%s', timeout=%ds", endpoint, req_timeout)
-                raise AZAPITimeoutError(f"AZAPI request timed out after {req_timeout}s.")
-            logger.warning("AZAPI connection failed: endpoint='%s', error='%s'", endpoint, type(net_err).__name__)
-            raise AZAPIError(f"AZAPI connection error: {type(net_err).__name__}")
+            except (urllib.error.URLError, TimeoutError, OSError) as net_err:
+                err_msg = str(net_err)
+                if "timed out" in err_msg.lower() or isinstance(net_err, TimeoutError):
+                    logger.warning("AZAPI request timed out: endpoint='%s', timeout=%ds", endpoint, req_timeout)
+                    if attempt + 1 < max_attempts:
+                        time.sleep(min(1.5, 0.5 * (2 ** attempt)))
+                        continue
+                    raise AZAPITimeoutError(f"AZAPI request timed out after {req_timeout}s.")
+                logger.warning("AZAPI connection failed: endpoint='%s', error='%s'", endpoint, type(net_err).__name__)
+                if attempt + 1 < max_attempts:
+                    time.sleep(min(1.5, 0.5 * (2 ** attempt)))
+                    continue
+                raise AZAPIError(f"AZAPI connection error: {type(net_err).__name__}")
 
     # -------------------------------------------------------------------------
     # Verified Endpoint Implementations

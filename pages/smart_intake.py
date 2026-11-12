@@ -127,6 +127,8 @@ if step == 1:
             raw_bytes,
             expected_requirement="Passport",
             passport_kind=passport_kind,
+            session_token=st_token,
+            require_auth=True,
         )
 
         extracted_fields = result.get('extracted_fields', {})
@@ -176,6 +178,8 @@ elif step == 2:
                 expected_requirement="Passport",
                 passport_kind=st.session_state.get('intake_passport_kind', 'indian'),
                 force_retry=True,
+                session_token=st.session_state.get('session_token'),
+                require_auth=True,
             )
             ext_f = retried.get('extracted_fields', {})
             st.session_state['intake_extracted'] = ext_f

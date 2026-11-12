@@ -1516,6 +1516,8 @@ def process_document(
     force_retry=False,
     back_file_bytes=None,
     back_filename=None,
+    session_token=None,
+    require_auth=False,
 ):
     warnings = []
     text = ""
@@ -1531,6 +1533,13 @@ def process_document(
     azapi_error = None
     azapi_endpoint = None
     azapi_cached = False
+
+    if require_auth or session_token is not None:
+        import auth_services
+        if not session_token or not isinstance(session_token, str) or not session_token.strip():
+            raise PermissionError("Unauthenticated: Valid session token required for OCR processing.")
+        auth_services.require_permission(session_token, "document:upload")
+
     if not isinstance(file_bytes, (bytes, bytearray)) or len(file_bytes) == 0:
         return {
             'document_type': 'Needs Review',
@@ -1553,8 +1562,79 @@ def process_document(
             'can_overwrite_verified': False,
         }
 
+    ext = os.path.splitext((file_name or "").strip())[1].lower()
+    if ext not in (".pdf", ".jpg", ".jpeg", ".png"):
+        return {
+            'document_type': 'Needs Review',
+            'type_confidence': 'low',
+            'source_type': 'manual_required',
+            'raw_text': '',
+            'extracted_fields': {'Document Details': ''},
+            'warnings': [f"Unsupported file extension '{ext or 'none'}'. Only PDF, JPG, JPEG, and PNG are allowed."],
+            'confidence': {},
+            'ocr_provider': 'manual_review',
+            'manual_review_required': True,
+            'can_retry_azapi': False,
+            'azapi_status': 'invalid_file_type',
+            'azapi_error': None,
+            'azapi_endpoint': None,
+            'azapi_cached': False,
+            'passport_kind': passport_kind,
+            'file_sha256': compute_bytes_sha256(file_bytes),
+            'is_reviewed': False,
+            'can_overwrite_verified': False,
+        }
+
+    if len(file_bytes) > 20 * 1024 * 1024:
+        return {
+            'document_type': 'Needs Review',
+            'type_confidence': 'low',
+            'source_type': 'manual_required',
+            'raw_text': '',
+            'extracted_fields': {'Document Details': ''},
+            'warnings': ["Document exceeds 20MB OCR limit. Manual review required."],
+            'confidence': {},
+            'ocr_provider': 'manual_review',
+            'manual_review_required': True,
+            'can_retry_azapi': False,
+            'azapi_status': 'oversized_file',
+            'azapi_error': None,
+            'azapi_endpoint': None,
+            'azapi_cached': False,
+            'passport_kind': passport_kind,
+            'file_sha256': compute_bytes_sha256(file_bytes),
+            'is_reviewed': False,
+            'can_overwrite_verified': False,
+        }
+
     resolved_doc_label, azapi_target = resolve_azapi_document_target(expected_requirement, passport_kind)
-    is_pdf = (file_name or "").lower().endswith('.pdf') or (isinstance(file_bytes, (bytes, bytearray)) and bytes(file_bytes[:4]) == b'%PDF')
+    is_pdf = ext == '.pdf' or bytes(file_bytes[:4]) == b'%PDF'
+    if not is_pdf:
+        try:
+            from PIL import Image
+            with Image.open(io.BytesIO(file_bytes)) as _im:
+                _im.verify()
+        except Exception:
+            return {
+                'document_type': 'Needs Review',
+                'type_confidence': 'low',
+                'source_type': 'manual_required',
+                'raw_text': '',
+                'extracted_fields': {sf: '' for sf in SCHEMAS.get(resolved_doc_label, ['Document Details'])},
+                'warnings': ["Corrupt or invalid image file content. Manual review required."],
+                'confidence': {},
+                'ocr_provider': 'manual_review',
+                'manual_review_required': True,
+                'can_retry_azapi': False,
+                'azapi_status': 'corrupt_image_manual',
+                'azapi_error': None,
+                'azapi_endpoint': None,
+                'azapi_cached': False,
+                'passport_kind': passport_kind,
+                'file_sha256': compute_bytes_sha256(file_bytes),
+                'is_reviewed': False,
+                'can_overwrite_verified': False,
+            }
 
     # Tier 1: Embedded PDF Text Analysis (pypdf only; zero OCR, zero AZAPI cost)
     if is_pdf:
@@ -1705,6 +1785,13 @@ def process_document(
                 reuse_note = "cached session result" if azapi_cached else f"endpoint {azapi_endpoint}"
                 warnings.append(f"[AZAPI Cloud OCR] Fields extracted via AZAPI.ai ({reuse_note}). Please confirm before saving.")
                 warnings.extend(az_res.get('warnings', []))
+                has_any_value = any(str(v).strip() for v in data.values())
+                has_suspicious_warn = any("mismatch" in w.lower() or "invalid" in w.lower() or "could not" in w.lower() or "check-digit" in w.lower() for w in warnings)
+                if not has_any_value or has_suspicious_warn:
+                    manual_review_required = True
+                    if not has_any_value:
+                        type_confidence = 'low'
+                        warnings.append("Incomplete OCR response (no usable fields extracted). Manual verification required.")
             else:
                 doc_type = resolved_doc_label
                 type_confidence = 'medium' if doc_type != 'Needs Review' else 'low'

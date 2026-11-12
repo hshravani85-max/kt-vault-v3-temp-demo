@@ -228,6 +228,8 @@ with col1:
                 file_bytes,
                 expected_requirement=req['name'],
                 passport_kind=p_kind,
+                session_token=st_token,
+                require_auth=True,
             )
         st.session_state['extracted_result'] = result
         st.session_state.pop('smart_upload_confirmed_type', None)
@@ -430,6 +432,8 @@ with col1:
                     expected_requirement=req['name'],
                     passport_kind=st.session_state.get('smart_upload_passport_kind'),
                     force_retry=True,
+                    session_token=st.session_state.get('session_token'),
+                    require_auth=True,
                 )
                 st.session_state['extracted_result'] = retried
                 for k in list(st.session_state.keys()):
