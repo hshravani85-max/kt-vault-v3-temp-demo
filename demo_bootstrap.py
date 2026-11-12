@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import secrets
 import sqlite3
 import uuid
 from datetime import datetime
@@ -232,18 +233,121 @@ def _build_synthetic_pdf(title: str, lines: list[str]) -> bytes:
     return raw.encode("latin-1")
 
 
+DEMO_ACCOUNT_SPECS = [
+    ("admin", "demo_admin", "KT_DEMO_ADMIN_PASS", "Demo Administrator", "Admin", "Executive"),
+    ("sales", "demo_sales", "KT_DEMO_SALES_PASS", "Demo Sales Executive", "Sales", "Sales"),
+]
+
+
+def _hash_demo_password(password: str) -> tuple[bytes, bytes]:
+    salt = secrets.token_bytes(16)
+    pwd_hash = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100000)
+    return pwd_hash, salt
+
+
+def _verify_demo_password(password: str, pwd_hash: bytes, salt: bytes) -> bool:
+    if not pwd_hash or not salt:
+        return False
+    computed = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100000)
+    return secrets.compare_digest(computed, pwd_hash)
+
+
 def _seed_demo_accounts(auth_services) -> int:
-    specs = [
-        ("demo_admin", "KT_DEMO_ADMIN_PASS", "Demo Administrator", "Admin", "Executive"),
-        ("demo_sales", "KT_DEMO_SALES_PASS", "Demo Sales Executive", "Sales", "Sales"),
-    ]
     created = 0
-    for uname, env_key, full_name, role, dept in specs:
+    for uname, _legacy, env_key, full_name, role, dept in DEMO_ACCOUNT_SPECS:
         pwd = os.environ.get(env_key, "").strip()
         if pwd:
             auth_services.create_user_account(uname, pwd, full_name, role, dept)
             created += 1
     return created
+
+
+def _sync_demo_accounts_transition(database, auth_services) -> list[str]:
+    """
+    Safely transitions an existing demo SQLite database (e.g. demo_admin/demo_sales -> admin/sales
+    or updated env/Secrets passwords) without modifying demo customers, trips, or encrypted documents.
+    Fails closed if non-demo customer rows exist.
+    """
+    conn = database.get_connection()
+    events = []
+    try:
+        non_demo = conn.execute(
+            "SELECT COUNT(*) FROM customers WHERE id NOT LIKE 'DEMO-%'"
+        ).fetchone()[0]
+        if non_demo > 0:
+            return ["SKIPPED_NON_DEMO_DB"]
+
+        audit_actions = []
+        for target_user, legacy_user, env_key, full_name, role, dept in DEMO_ACCOUNT_SPECS:
+            desired_pwd = os.environ.get(env_key, "").strip()
+            target_row = conn.execute("SELECT * FROM users WHERE username = ?", (target_user,)).fetchone()
+            legacy_row = conn.execute("SELECT * FROM users WHERE username = ?", (legacy_user,)).fetchone()
+
+            if legacy_row and not target_row:
+                uid = legacy_row["id"]
+                conn.execute("DELETE FROM sessions WHERE user_id = ?", (uid,))
+                conn.execute("DELETE FROM pending_mfa_sessions WHERE user_id = ?", (uid,))
+                if desired_pwd:
+                    pwd_hash, salt = _hash_demo_password(desired_pwd)
+                else:
+                    pwd_hash, salt = legacy_row["password_hash"], legacy_row["salt"]
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET username = ?, full_name = ?, role = ?, department = ?,
+                        is_active = 1, failed_attempts = 0, locked_until = NULL,
+                        password_hash = ?, salt = ?,
+                        mfa_enabled = 0, mfa_secret = NULL, mfa_enrolled_at = NULL,
+                        mfa_last_used_step = 0, mfa_failed_attempts = 0,
+                        mfa_locked_until = NULL, mfa_recovery_hashes = NULL
+                    WHERE id = ?
+                    """,
+                    (target_user, full_name, role, dept, pwd_hash, salt, uid),
+                )
+                events.append(f"renamed:{legacy_user}->{target_user}")
+                audit_actions.append(("DEMO_ACCOUNT_TRANSITIONED", target_user, uid, role, f"Renamed {legacy_user} -> {target_user}"))
+            elif target_row:
+                uid = target_row["id"]
+                if target_row["is_active"] != 1 or target_row["role"] != role or target_row["department"] != dept:
+                    conn.execute(
+                        "UPDATE users SET is_active = 1, role = ?, department = ?, full_name = ? WHERE id = ?",
+                        (role, dept, full_name, uid),
+                    )
+                    events.append(f"updated_role:{target_user}")
+                if desired_pwd and not _verify_demo_password(desired_pwd, target_row["password_hash"], target_row["salt"]):
+                    pwd_hash, salt = _hash_demo_password(desired_pwd)
+                    conn.execute("DELETE FROM sessions WHERE user_id = ?", (uid,))
+                    conn.execute("DELETE FROM pending_mfa_sessions WHERE user_id = ?", (uid,))
+                    conn.execute(
+                        "UPDATE users SET password_hash = ?, salt = ?, failed_attempts = 0, locked_until = NULL WHERE id = ?",
+                        (pwd_hash, salt, uid),
+                    )
+                    events.append(f"password_rotated:{target_user}")
+                    audit_actions.append(("DEMO_PASSWORD_UPDATED", target_user, uid, role, "Updated demo account password from secrets"))
+            elif desired_pwd:
+                conn.commit()
+                auth_services.create_user_account(target_user, desired_pwd, full_name, role, dept)
+                events.append(f"created:{target_user}")
+
+        # Non-destructively deactivate any obsolete demo accounts (e.g. legacy demo_ops/demo_auditor/demo_admin)
+        obsolete_rows = conn.execute(
+            "SELECT id, username FROM users WHERE username NOT IN ('admin', 'sales') AND is_active = 1"
+        ).fetchall()
+        for ob in obsolete_rows:
+            conn.execute("DELETE FROM sessions WHERE user_id = ?", (ob["id"],))
+            conn.execute("DELETE FROM pending_mfa_sessions WHERE user_id = ?", (ob["id"],))
+            conn.execute("UPDATE users SET is_active = 0 WHERE id = ?", (ob["id"],))
+            events.append(f"deactivated:{ob['username']}")
+            audit_actions.append(("DEMO_LEGACY_ACCOUNT_DEACTIVATED", ob["username"], ob["id"], "Disabled", "Deactivated superseded demo account"))
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    for ev_type, uname, uid, role_name, details in audit_actions:
+        auth_services.log_security_event(ev_type, username=uname, user_id=uid, role=role_name, details=details)
+
+    return events
 
 
 def _seed_demo_business_data(conn, storage_service, storage_root: str) -> None:
@@ -401,7 +505,16 @@ def ensure_demo_vault() -> dict:
         ).fetchone() is not None
         user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] if has_users else 0
         if has_users and user_count > 0:
-            return {"bootstrapped": False, "reason": "Demo DB already initialized", "users": user_count}
+            conn.close()
+            auth_services.init_auth_schema()
+            mfa_service.init_mfa_schema()
+            transitions = _sync_demo_accounts_transition(database, auth_services)
+            return {
+                "bootstrapped": False,
+                "reason": "Demo DB already initialized",
+                "users": user_count,
+                "transitions": transitions,
+            }
 
         conn.executescript(DEMO_SCHEMA_SQL)
         conn.commit()
