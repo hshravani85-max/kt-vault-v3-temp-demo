@@ -234,10 +234,8 @@ def _build_synthetic_pdf(title: str, lines: list[str]) -> bytes:
 
 def _seed_demo_accounts(auth_services) -> int:
     specs = [
-        ("demo_admin", "KT_DEMO_ADMIN_PASS", "Demo Administrator", "Administrator", "Executive"),
-        ("demo_ops", "KT_DEMO_OPS_PASS", "Demo Operations Lead", "Operations", "Operations"),
+        ("demo_admin", "KT_DEMO_ADMIN_PASS", "Demo Administrator", "Admin", "Executive"),
         ("demo_sales", "KT_DEMO_SALES_PASS", "Demo Sales Executive", "Sales", "Sales"),
-        ("demo_auditor", "KT_DEMO_AUDITOR_PASS", "Demo Compliance Auditor", "Read-only Auditor", "Compliance"),
     ]
     created = 0
     for uname, env_key, full_name, role, dept in specs:
